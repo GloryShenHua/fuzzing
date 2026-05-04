@@ -82,11 +82,12 @@ def interesting_random_bytes(s: str) -> str:
     if not s:
         return s
 
-    # 定义各类型的 interesting values
+    # AFL 风格的 interesting values：边界值与常见溢出临界点
     interesting_values = {
-        1: [ord(c) for c in ['A', 'B', 'C', 'Z', '0', '9', '!', '?']],  # 单字节显示字符
-        2: [int.from_bytes(b, 'big') for b in [b'OK', b'Hi', b'42', b'Go']],  # 2 字节 ASCII
-        4: [int.from_bytes(b, 'big') for b in [b'TEST', b'DEAD', b'BEEF', b'GOOD']],  # 4 字节 ASCII
+        1: [0, 1, 16, 32, 64, 100, 127, 128, 200, 254, 255],
+        2: [0, 1, 128, 255, 256, 512, 1000, 1024, 4096, 32767, 32768, 65534, 65535],
+        4: [0, 1, 128, 255, 256, 512, 65535, 65536, 100000,
+            0x7fffffff, 0x80000000, 0xfffffffe, 0xffffffff],
     }
 
 
@@ -99,10 +100,11 @@ def interesting_random_bytes(s: str) -> str:
     
     # 随机选择替换位置，确保不越界
     pos = random.randint(0, len(data) - N)
-    
-    # 随机选择一个 interesting value，并转换为字节序列
+
+    # 随机选择一个 interesting value，并转换为字节序列（随机大小端）
     value = random.choice(interesting_values[N])
-    value_bytes = value.to_bytes(N, byteorder='big')  # 使用 big endian
+    endian = random.choice(['big', 'little'])
+    value_bytes = (value % (256 ** N)).to_bytes(N, byteorder=endian)
     
     # 替换相应的 N 字节
     for i in range(N):
@@ -165,11 +167,8 @@ def havoc_random_replace(s: str):
 
     if random.random() < 0.75:
         # 75% 概率用原文中随机一段替换
-        if length - replace_len == 0:
-            replace_bytes = bytearray()
-        else:
-            start = random.randint(0, length - replace_len)
-            replace_bytes = data[start:start + replace_len]
+        start = random.randint(0, length - replace_len)
+        replace_bytes = data[start:start + replace_len]
     else:
         # 25% 概率用随机生成的可打印 ASCII 替换
         replace_bytes = bytearray(random.randint(0x20, 0x7E) for _ in range(replace_len))
@@ -178,6 +177,82 @@ def havoc_random_replace(s: str):
     new_data = data[:pos] + replace_bytes + data[pos + replace_len:]
 
     return new_data.decode('utf-8', errors='ignore')
+
+def delete_random_bytes(s: str) -> str:
+    """
+    随机删除 s 中一段连续的字节（长度为 1 到 min(8, len-1)）
+    保留至少 1 个字节，避免产生空字符串
+    """
+    if len(s) < 2:
+        return s
+
+    data = bytearray(s.encode('utf-8', errors='ignore'))
+    length = len(data)
+    if length < 2:
+        return s
+
+    delete_len = random.randint(1, min(8, length - 1))
+    pos = random.randint(0, length - delete_len)
+
+    new_data = data[:pos] + data[pos + delete_len:]
+    return new_data.decode('utf-8', errors='ignore')
+
+
+def repeat_random_byte(s: str) -> str:
+    """
+    随机选取一个 byte 值，将 s 中从随机位置起连续的 N 个字节全部覆写为该值（N = 1~8）
+    类似 AFL 的 memset 变异：制造重复字节序列，触发重复相关路径与溢出临界行为
+    """
+    if not s:
+        return s
+
+    data = bytearray(s.encode('utf-8', errors='ignore'))
+    length = len(data)
+    if length == 0:
+        return s
+
+    N = random.randint(1, min(8, length))
+    pos = random.randint(0, length - N)
+    # 要覆写的值：50% 取原字符串中已有的某个 byte，50% 取随机可打印 byte
+    if random.random() < 0.5:
+        fill_byte = data[random.randint(0, length - 1)]
+    else:
+        fill_byte = random.randint(0x20, 0x7E)
+
+    for i in range(N):
+        data[pos + i] = fill_byte
+
+    return data.decode('utf-8', errors='ignore')
+
+
+# 针对各类目标场景预置的特殊边界 token
+_SPECIAL_TOKENS = [
+    # 控制字符与空白
+    '\x00', '\n', '\r\n', '\t',
+    # 格式化字符串触发符（对应 sample2: temp % len(s) / temp.format(...)）
+    '%s', '%d', '%n', '%x', '%%', '{Key}', '{}', '{0}',
+    # 浮点边界（对应 sample1: float(s) / division）
+    '0', '1', '-1', '0.0', '1e308', '-1e308', 'inf', '-inf', 'nan', '1.0',
+    # 路径与注入
+    '../', '/', '\\',
+    # HTML 特殊字符（对应 sample4: HTMLParser）
+    '<', '>', '&', '"', "'", '<!--', '/>', '<!DOCTYPE>',
+    # 分隔符（对应 sample2: s.split(".")）
+    '.', '..', '....',
+    # 长重复字串（触发索引越界）
+    'A' * 32, '\xff' * 4, '\x00' * 4,
+]
+
+
+def insert_special_token(s: str) -> str:
+    """
+    从预置的特殊边界 token 表中随机选取一个，插入到 s 的随机位置
+    目标覆盖：格式化字符串、浮点边界、HTML 特殊字符、路径遍历、控制字符等典型崩溃触发场景
+    """
+    token = random.choice(_SPECIAL_TOKENS)
+    pos = random.randint(0, len(s))
+    return s[:pos] + token + s[pos:]
+
 
 def random_block_swap(s: str) -> str:
     """
@@ -222,7 +297,10 @@ class Mutator:
             interesting_random_bytes,
             havoc_random_insert,
             havoc_random_replace,
-            random_block_swap
+            delete_random_bytes,
+            random_block_swap,
+            repeat_random_byte,
+            insert_special_token,
         ]
 
     def mutate(self, inp: Any) -> Any:

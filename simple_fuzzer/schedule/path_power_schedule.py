@@ -12,4 +12,6 @@ class PathPowerSchedule(PowerSchedule):
 
     def assign_energy(self, population: Sequence[Seed]) -> None:
         """Assign exponential energy inversely proportional to path frequency"""
-        # TODO
+        # TODO: 实现基于路径频率的能量分配
+        # 当前回退到父类的均匀分配，保证 fuzzer 能够运行
+        super().assign_energy(population)

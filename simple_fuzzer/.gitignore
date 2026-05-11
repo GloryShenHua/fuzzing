@@ -1,1 +1,10 @@
 .idea
+_result/
+_persist/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.pytest_cache/

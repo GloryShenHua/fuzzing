@@ -30,6 +30,11 @@ class FunctionCoverageRunner(Runner):
     def coverage(self) -> Set[Location]:
         return self._coverage
     
+    def trim_coverage_history(self, keep_last: int = 1000):
+        """仅保留最近 keep_last 条覆盖率记录，避免内存无限增长"""
+        if len(self.cumulative_coverage) > keep_last:
+            self.cumulative_coverage = self.cumulative_coverage[-keep_last:]
+
     def run(self, inp: str) -> Tuple[Any, str]:
         try:
             result = self.run_function(inp)

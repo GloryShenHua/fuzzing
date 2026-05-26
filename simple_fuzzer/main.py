@@ -5,6 +5,7 @@ import time
 from fuzzer.path_grey_box_fuzzer import PathGreyBoxFuzzer
 from runner.function_coverage_runner import FunctionCoverageRunner
 from schedule.path_power_schedule import PathPowerSchedule
+from schedule.density_power_schedule import DensityPowerSchedule
 from samples.samples import sample1, sample2, sample3, sample4
 from utils.object_utils import dump_object, load_object
 
@@ -44,6 +45,8 @@ def parse_args():
                         help="Resume from a previous checkpoint if available")
     parser.add_argument("--quiet", action="store_true",
                         help="Disable the status table output")
+    parser.add_argument("--schedule", default="path", choices=("path", "density"),
+                        help="Scheduling strategy to use")
     return parser.parse_args()
 
 
@@ -54,7 +57,12 @@ if __name__ == "__main__":
     f_runner = FunctionCoverageRunner(target_function)
     seeds = load_object(corpus_path)
 
-    grey_fuzzer = PathGreyBoxFuzzer(seeds=seeds, schedule=PathPowerSchedule(),
+    if args.schedule == "density":
+        schedule = DensityPowerSchedule()
+    else:
+        schedule = PathPowerSchedule()
+
+    grey_fuzzer = PathGreyBoxFuzzer(seeds=seeds, schedule=schedule,
                                     is_print=not args.quiet, persist_dir=args.persist_dir)
 
     if args.resume and grey_fuzzer.load_checkpoint():

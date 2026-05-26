@@ -39,6 +39,10 @@ def parse_args():
                         help="Fuzzing duration in seconds")
     parser.add_argument("--output-dir", default="_result",
                         help="Directory used to persist the run result")
+    parser.add_argument("--persist-dir", default="_persist",
+                        help="Directory used to persist intermediate data (seeds, crashes, snapshots)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from a previous checkpoint if available")
     parser.add_argument("--quiet", action="store_true",
                         help="Disable the status table output")
     parser.add_argument("--schedule", default="path", choices=("path", "density"),
@@ -58,9 +62,19 @@ if __name__ == "__main__":
     else:
         schedule = PathPowerSchedule()
 
-    grey_fuzzer = PathGreyBoxFuzzer(seeds=seeds, schedule=schedule, is_print=not args.quiet)
+    grey_fuzzer = PathGreyBoxFuzzer(seeds=seeds, schedule=schedule,
+                                    is_print=not args.quiet, persist_dir=args.persist_dir)
+
+    if args.resume and grey_fuzzer.load_checkpoint():
+        print(f"[*] Resumed from checkpoint: {grey_fuzzer.total_execs} execs, "
+              f"{len(grey_fuzzer.covered_line)} covered lines, "
+              f"{len(set(grey_fuzzer.crash_map.values()))} unique crashes")
+
     start_time = time.time()
     grey_fuzzer.runs(f_runner, run_time=args.run_time)
+
+    # 运行结束保存断点
+    grey_fuzzer.save_checkpoint()
 
     res = Result(grey_fuzzer.covered_line, set(grey_fuzzer.crash_map.values()), start_time, time.time())
     output_path = os.path.join(args.output_dir, f"Sample-{args.sample}.pkl")

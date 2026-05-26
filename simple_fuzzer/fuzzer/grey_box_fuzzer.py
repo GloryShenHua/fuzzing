@@ -11,16 +11,21 @@ from utils.mutator import Mutator
 from runner.function_coverage_runner import FunctionCoverageRunner
 from schedule.power_schedule import PowerSchedule
 
+from utils.object_utils import dump_object, load_object
 from utils.seed import Seed
 
 
 class GreyBoxFuzzer(Fuzzer):
 
-    def __init__(self, seeds: List[str], schedule: PowerSchedule, is_print: bool) -> None:
+    MAX_POPULATION = 1000
+    SNAPSHOT_INTERVAL = 30  # 秒
+
+    def __init__(self, seeds: List[str], schedule: PowerSchedule, is_print: bool,
+                 persist_dir: str = "_persist") -> None:
         """Constructor.
         `seeds` - a list of (input) strings to mutate.
-        `mutator` - the mutator to apply.
         `schedule` - the power schedule to apply.
+        `persist_dir` - 持久化根目录。
         """
         super().__init__()
         self.is_print = is_print
@@ -33,11 +38,28 @@ class GreyBoxFuzzer(Fuzzer):
         self.seeds = seeds
         self.mutator = Mutator()
         self.schedule = schedule
+
+        # 持久化相关
+        self.persist_dir = persist_dir
+        self._evict_counter = 0
+        self._snapshot_counter = 0
+        self._crash_counter = 0
+        self._last_snapshot_time = self.start_time
+        self._persist_dirs_ready = False
+
         if is_print:
             print("""
 ┌───────────────────────┬───────────────────────┬───────────────────┬────────────────┬───────────────────┐
 │        Run Time       │    Last Uniq Crash    │    Total Execs    │  Uniq Crashes  │   Covered Lines   │
 ├───────────────────────┼───────────────────────┼───────────────────┼────────────────┼───────────────────┤""")
+
+    def _ensure_persist_dirs(self):
+        """惰性创建持久化子目录（首次使用时才创建）"""
+        if self._persist_dirs_ready:
+            return
+        for subdir in ("evicted_seeds", "crashes", "coverage_snapshots"):
+            os.makedirs(os.path.join(self.persist_dir, subdir), exist_ok=True)
+        self._persist_dirs_ready = True
 
 
     def create_candidate(self) -> str:
@@ -83,6 +105,73 @@ class GreyBoxFuzzer(Fuzzer):
                                    covered_line=str(len(self.covered_line)).center(19))
         print(template)
 
+    def _evict_lowest_seed(self):
+        """淘汰最低能量 seed，淘汰前先持久化到磁盘"""
+        if not self.population:
+            return
+        self._ensure_persist_dirs()
+        min_idx = min(range(len(self.population)),
+                      key=lambda i: self.population[i].energy)
+        evicted = self.population[min_idx]
+        path = os.path.join(self.persist_dir, "evicted_seeds",
+                            f"seed_{self._evict_counter:06d}.pkl")
+        dump_object(path, evicted)
+        self._evict_counter += 1
+        del self.population[min_idx]
+
+    def _persist_crash(self, inp: str, crash_hash: str):
+        """将崩溃信息持久化到磁盘"""
+        self._ensure_persist_dirs()
+        crash_info = {
+            "input": inp,
+            "stack_hash": crash_hash,
+            "timestamp": time.time(),
+        }
+        path = os.path.join(self.persist_dir, "crashes",
+                            f"crash_{self._crash_counter:06d}.pkl")
+        dump_object(path, crash_info)
+        self._crash_counter += 1
+
+    def _persist_coverage_snapshot(self):
+        """将当前覆盖率状态保存到磁盘"""
+        self._ensure_persist_dirs()
+        snapshot = {
+            "timestamp": time.time(),
+            "covered_line_count": len(self.covered_line),
+            "total_execs": self.total_execs,
+            "unique_crashes": len(set(self.crash_map.values())),
+        }
+        path = os.path.join(self.persist_dir, "coverage_snapshots",
+                            f"snapshot_{self._snapshot_counter:04d}.pkl")
+        dump_object(path, snapshot)
+        self._snapshot_counter += 1
+
+    def save_checkpoint(self):
+        """保存断点，用于后续恢复"""
+        self._ensure_persist_dirs()
+        checkpoint = {
+            "population": self.population,
+            "covered_line": self.covered_line,
+            "crash_map": self.crash_map,
+            "total_execs": self.total_execs,
+            "seed_index": self.seed_index,
+        }
+        path = os.path.join(self.persist_dir, "checkpoint.pkl")
+        dump_object(path, checkpoint)
+
+    def load_checkpoint(self) -> bool:
+        """从断点恢复状态，成功返回 True"""
+        path = os.path.join(self.persist_dir, "checkpoint.pkl")
+        if not os.path.exists(path):
+            return False
+        checkpoint = load_object(path)
+        self.population = checkpoint["population"]
+        self.covered_line = checkpoint["covered_line"]
+        self.crash_map = checkpoint["crash_map"]
+        self.total_execs = checkpoint["total_execs"]
+        self.seed_index = checkpoint["seed_index"]
+        return True
+
     def run(self, runner: FunctionCoverageRunner) -> Tuple[Any, str]:  # type: ignore
         """Run function(inp) while tracking coverage.
            If we reach new coverage,
@@ -95,8 +184,20 @@ class GreyBoxFuzzer(Fuzzer):
                 # We have new coverage
                 seed = Seed(self.inp, runner.coverage())
                 self.population.append(seed)
+                # 人口超限时淘汰最低能量 seed（淘汰前先持久化）
+                if len(self.population) > self.MAX_POPULATION:
+                    self._evict_lowest_seed()
         if outcome == Runner.FAIL:
             self.last_crash_time = time.time()
+            if result not in self.crash_map.values():
+                self._persist_crash(self.inp, result)
             self.crash_map[self.inp] = result
+
+        # 周期持久化：覆盖率快照 + 修剪 runner 历史
+        now = time.time()
+        if now - self._last_snapshot_time > self.SNAPSHOT_INTERVAL:
+            self._persist_coverage_snapshot()
+            runner.trim_coverage_history()
+            self._last_snapshot_time = now
 
         return result, outcome

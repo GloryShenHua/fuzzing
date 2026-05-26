@@ -13,14 +13,19 @@ class PathGreyBoxFuzzer(GreyBoxFuzzer):
                  persist_dir: str = "_persist"):
         super().__init__(seeds, schedule, False, persist_dir=persist_dir)
 
-        # TODO
+        self.is_print = is_print
+        self.last_path_time = self.start_time
 
-        print("""
+        if self.is_print:
+            print("""
 ┌───────────────────────┬───────────────────────┬───────────────────────┬───────────────────┬───────────────────┬────────────────┬───────────────────┐
 │        Run Time       │     Last New Path     │    Last Uniq Crash    │    Total Execs    │    Total Paths    │  Uniq Crashes  │   Covered Lines   │
 ├───────────────────────┼───────────────────────┼───────────────────────┼───────────────────┼───────────────────┼────────────────┼───────────────────┤""")
 
     def print_stats(self):
+        if not self.is_print:
+            return
+
         def format_seconds(seconds):
             hours = int(seconds) // 3600
             minutes = int(seconds % 3600) // 60
@@ -30,10 +35,10 @@ class PathGreyBoxFuzzer(GreyBoxFuzzer):
         template = """│{runtime}│{path_time}│{crash_time}│{total_exec}│{total_path}│{uniq_crash}│{covered_line}│
 ├───────────────────────┼───────────────────────┼───────────────────────┼───────────────────┼───────────────────┼────────────────┼───────────────────┤"""
         template = template.format(runtime=format_seconds(time.time() - self.start_time).center(23),
-                                   path_time="".center(23),
+                                   path_time=format_seconds(self.last_path_time - self.start_time).center(23),
                                    crash_time=format_seconds(self.last_crash_time - self.start_time).center(23),
                                    total_exec=str(self.total_execs).center(19),
-                                   total_path="".center(19),
+                                   total_path=str(len(self.schedule.path_frequency)).center(19),
                                    uniq_crash=str(len(set(self.crash_map.values()))).center(16),
                                    covered_line=str(len(self.covered_line)).center(19))
         print(template)
@@ -42,6 +47,7 @@ class PathGreyBoxFuzzer(GreyBoxFuzzer):
         """Inform scheduler about path frequency"""
         result, outcome = super().run(runner)
 
-        # TODO
+        if self.schedule.update_path_frequency(runner.coverage()):
+            self.last_path_time = time.time()
 
         return result, outcome

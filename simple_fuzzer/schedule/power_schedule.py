@@ -1,5 +1,5 @@
 import random
-from typing import List
+from typing import List, Sequence
 
 from utils.seed import Seed
 
@@ -8,7 +8,7 @@ MAX_SEEDS = 1000
 
 class PowerSchedule:
 
-    def assign_energy(self, population: List[Seed]) -> None:
+    def assign_energy(self, population: Sequence[Seed]) -> None:
         """Assigns each seed the same energy"""
         for seed in population:
             seed.energy = 1
@@ -22,12 +22,11 @@ class PowerSchedule:
         return norm_energy
 
     def choose(self, population: List[Seed]) -> Seed:
-        """Choose weighted by normalized energy."""
+        """Choose weighted by normalized energy.
+           人口裁剪由  GreyBoxFuzzer  在持久化淘汰  seed  后统一完成，
+           此处不再直接删除元素。
+        """
         self.assign_energy(population)
         norm_energy = self.normalized_energy(population)
-        if len(population) > MAX_SEEDS:
-            min_index = norm_energy.index(min(norm_energy))
-            del norm_energy[min_index]
-            del population[min_index]
         seed: Seed = random.choices(population, weights=norm_energy)[0]
         return seed

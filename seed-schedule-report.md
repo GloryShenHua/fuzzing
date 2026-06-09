@@ -114,3 +114,140 @@ done
 
 在实现前，`PathPowerSchedule.assign_energy()` 尚未为 seed 设置有效 energy，导致 population 中 seed 的 energy 总和为 0，父类 `PowerSchedule.normalized_energy()` 中的断言失败。实现路径频率调度后，每个 seed 都会根据其路径频率获得正数 energy，因此加权调度可以正常工作。
 
+## 七、GreyBoxFuzzer 中 seed 管理与持久化完善
+
+在后续测试过程中，进一步完善了 `GreyBoxFuzzer` 中 seed 管理和持久化逻辑。该部分虽然不直接属于 `PathPowerSchedule` 的 energy 公式，但它会直接影响 Scheduler 能够调度到哪些 seed，因此也是 seed 调度闭环中的关键环节。
+
+### 7.1 新覆盖输入的入池策略
+
+原始实现中，只有当输入带来新覆盖且执行结果为 `PASS` 时，才会被加入 `population`：
+
+```python
+if outcome == Runner.PASS:
+    seed = Seed(self.inp, runner.coverage())
+    self.population.append(seed)
+```
+
+这种策略在一般情况下可以工作，但对于 fuzzing 来说偏保守。某些输入虽然触发了异常，但它们已经进入了更深的分支，代表了有价值的程序状态。如果完全丢弃这些输入，后续 mutation 就无法继续围绕该深层路径附近进行探索。
+
+因此当前实现调整为：只要输入带来新覆盖，就加入 `population` 作为后续变异的 frontier seed；如果该输入同时触发 crash，则仍然在 crash 逻辑中单独记录。
+
+```python
+if len(self.covered_line) != len(runner.all_coverage):
+    self.covered_line |= runner.all_coverage
+    seed = Seed(self.inp, runner.coverage())
+    self.population.append(seed)
+    if len(self.population) > self.MAX_POPULATION:
+        self._evict_lowest_seed()
+
+if outcome == Runner.FAIL:
+    self.last_crash_time = time.time()
+    if result not in self.crash_map.values():
+        self._persist_crash(self.inp, result)
+    self.crash_map[self.inp] = result
+```
+
+这样做的好处是，Scheduler 的候选集合不仅包含“正常通过”的输入，也包含“虽然崩溃但带来新覆盖”的输入。对于 Sample 3 这类深层条件分支，该策略可以显著提高继续探索深层分支的机会。
+
+### 7.2 Population 上限与 seed 淘汰持久化
+
+为了避免长时间 fuzzing 导致内存中的 `population` 无限增长，`GreyBoxFuzzer` 设置了 `MAX_POPULATION = 1000`。当 population 超出上限时，会淘汰当前 energy 最低的 seed。
+
+淘汰前不会直接丢弃该 seed，而是将其序列化保存到磁盘：
+
+```python
+path = os.path.join(self.persist_dir, "evicted_seeds",
+                    f"seed_{self._evict_counter:06d}.pkl")
+dump_object(path, evicted)
+self._evict_counter += 1
+del self.population[min_idx]
+```
+
+这满足了“将 Seed 持久化进入文件系统、防止内存占用过高”的实验要求。内存中只保留当前最有调度价值的一部分 seed，被淘汰的 seed 仍保存在 `_persist*/evicted_seeds/` 中，便于后续分析或恢复。
+
+### 7.3 Crash 与覆盖率快照持久化
+
+除 seed 淘汰外，`GreyBoxFuzzer` 还会持久化 crash 信息和覆盖率快照：
+
+```text
+persist_dir/
+├── checkpoint.pkl
+├── crashes/
+├── coverage_snapshots/
+└── evicted_seeds/
+```
+
+其中：
+
+- `crashes/` 保存唯一崩溃输入、栈哈希和时间戳。
+- `coverage_snapshots/` 周期性保存覆盖行数、执行次数和唯一崩溃数。
+- `checkpoint.pkl` 保存当前 population、覆盖集合、崩溃映射、执行次数和 seed 读取进度。
+
+覆盖率快照默认每 30 秒写入一次：
+
+```python
+SNAPSHOT_INTERVAL = 30
+```
+
+长时间运行时，这可以记录 fuzzing 过程中的覆盖率增长趋势。
+
+### 7.4 Checkpoint 与 resume 完善
+
+为了支持 `--resume` 后继续 fuzzing，当前 checkpoint 除了保存基础状态外，还保存了 Scheduler 状态和持久化计数器：
+
+```python
+checkpoint = {
+    "population": self.population,
+    "covered_line": self.covered_line,
+    "crash_map": self.crash_map,
+    "total_execs": self.total_execs,
+    "seed_index": self.seed_index,
+    "schedule": self.schedule,
+    "last_crash_time": self.last_crash_time,
+    "persist_counters": {
+        "evict": self._evict_counter,
+        "snapshot": self._snapshot_counter,
+        "crash": self._crash_counter,
+    },
+}
+```
+
+恢复时，`load_checkpoint()` 会恢复 population、覆盖率、crash map、执行次数和 Scheduler，并重新计算下一次应使用的文件编号：
+
+```python
+self._evict_counter = max(counters.get("evict", 0),
+                          self._next_persist_index("evicted_seeds", "seed_"))
+self._snapshot_counter = max(counters.get("snapshot", 0),
+                             self._next_persist_index("coverage_snapshots", "snapshot_"))
+self._crash_counter = max(counters.get("crash", 0),
+                          self._next_persist_index("crashes", "crash_"))
+```
+
+这里额外扫描已有文件，是为了避免 resume 后从 `seed_000000.pkl`、`crash_000000.pkl` 或 `snapshot_0000.pkl` 重新写入，覆盖之前的结果。
+
+## 八、补充验证结果
+
+对持久化逻辑进行了最小化验证：
+
+```text
+crashes ['crash_000000.pkl', 'crash_000001.pkl']
+snapshots ['snapshot_0000.pkl', 'snapshot_0001.pkl']
+evicted ['seed_000000.pkl', 'seed_000001.pkl']
+seed_000000.pkl Seed 'seed-a'
+seed_000001.pkl Seed 'seed-c'
+```
+
+该结果说明：
+
+1. crash 信息可以连续持久化，且 resume 后不会覆盖旧文件。
+2. coverage snapshot 可以连续持久化，且编号正确递增。
+3. 被淘汰的 Seed 对象可以保存到 `evicted_seeds/`，并能通过 `load_object()` 正确反序列化。
+
+同时使用当前代码进行了 10 秒回归测试：
+
+| Scheduler | Sample 1 | Sample 2 | Sample 3 | Sample 4 |
+|---|---:|---:|---:|---:|
+| path 10s | 100% / 6 crashes | 100% / 4 crashes | 100% / 9 crashes | 100% / 0 crashes |
+| density 10s | 100% / 6 crashes | 100% / 4 crashes | 100% / 9 crashes | 100% / 0 crashes |
+
+回归结果表明，新的 seed 入池策略和持久化恢复逻辑没有破坏原有 fuzzing 流程，且能够稳定达到目标 Sample 函数的高覆盖率。
